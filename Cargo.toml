@@ -1,0 +1,12 @@
+[package]
+name = "ckb-vm-signal-profiler"
+version = "0.1.0"
+edition = "2018"
+description = "Linux signal based profiler for ckb-vm, note this is profiling ckb-vm itself, not the programs running in ckb-vm"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ckb-vm = { version = "0.21.1", features = ["asm"] }
+nix = "0.23.1"
+lazy_static = "1.4.0"
