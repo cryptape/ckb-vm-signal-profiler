@@ -1,6 +1,9 @@
+mod timer;
+
 #[macro_use]
 extern crate lazy_static;
 
+use crate::timer::Timer;
 use ckb_vm::{machine::asm::AsmMachine, CoreMachine};
 use nix::sys::signal;
 use std::ops::Deref;
@@ -10,21 +13,21 @@ use std::sync::Mutex;
 
 lazy_static! {
     pub static ref PROFILER: Mutex<Profiler> = Mutex::new(Profiler {
-        start: false,
         fname: "".to_string(),
         machine: 0,
+        timer: None,
     });
 }
 
 pub struct Profiler {
-    start: bool,
     fname: String,
     machine: usize,
+    timer: Option<Timer>,
 }
 
 extern "C" fn perf_signal_handler(_signal: c_int) {
     let profiler = PROFILER.lock().expect("Mutex lock failure");
-    if !profiler.start {
+    if !profiler.is_start() {
         return;
     }
 
@@ -35,11 +38,14 @@ extern "C" fn perf_signal_handler(_signal: c_int) {
 }
 
 impl Profiler {
+    pub fn is_start(&self) -> bool {
+        self.timer.is_some()
+    }
+
     pub fn start(&mut self, fname: &str, machine: &Pin<Box<AsmMachine>>) -> Result<(), String> {
-        if self.start {
+        if self.is_start() {
             return Err("Profiler already started!".to_string());
         }
-        self.start = true;
         self.fname = fname.to_string();
         self.machine = machine.deref() as *const AsmMachine as usize;
 
@@ -53,11 +59,13 @@ impl Profiler {
         unsafe { signal::sigaction(signal::SIGPROF, &sigaction) }
             .map_err(|e| format!("sigaction install error: {}", e))?;
 
+        self.timer = Some(Timer::new(99));
+
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
-        if !self.start {
+        if !self.is_start() {
             return Err("Profiler not started!".to_string());
         }
 
@@ -68,9 +76,9 @@ impl Profiler {
 
         // TODO: write profiling data to file fname
 
-        self.start = false;
         self.fname = "".to_string();
         self.machine = 0;
+        self.timer = None;
 
         Ok(())
     }
