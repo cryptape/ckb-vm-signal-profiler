@@ -63,10 +63,7 @@ fn main() {
         .build();
     let mut machine = Box::pin(AsmMachine::new(core, None));
 
-    ckb_vm_signal_profiler::PROFILER
-        .lock()
-        .expect("mutex lock failure")
-        .start("test.profile", &machine)
+    ckb_vm_signal_profiler::start_profiler("simple.profile", &machine, &code, 99)
         .expect("profiler start failure");
 
     machine.load_program(&code, &args).unwrap();
@@ -75,4 +72,5 @@ fn main() {
         println!("Error result: {:?}", result);
         exit(i32::from(result.unwrap_or(-1)));
     }
+    ckb_vm_signal_profiler::stop_profiler().expect("profiler start failure");
 }
