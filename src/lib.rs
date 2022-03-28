@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 lazy_static! {
-    pub static ref PROFILER: Mutex<Option<Profiler>> = Mutex::new(None);
+    static ref PROFILER: Mutex<Option<Profiler>> = Mutex::new(None);
 }
 
 type Addr2LineEndianReader =
@@ -28,12 +28,12 @@ type Addr2LineEndianReader =
 type Addr2LineContext = addr2line::Context<Addr2LineEndianReader>;
 type Addr2LineFrameIter<'a> = addr2line::FrameIter<'a, Addr2LineEndianReader>;
 
-pub struct DebugContext {
-    pub addr_context: Addr2LineContext,
-    pub debug_frame: addr2line::gimli::DebugFrame<Addr2LineEndianReader>,
+struct DebugContext {
+    addr_context: Addr2LineContext,
+    debug_frame: addr2line::gimli::DebugFrame<Addr2LineEndianReader>,
 }
 
-pub struct Profiler {
+struct Profiler {
     fname: String,
     machine: usize,
     context: DebugContext,
