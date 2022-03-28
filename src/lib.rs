@@ -19,6 +19,73 @@ use std::os::raw::c_int;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+pub fn is_profiler_started() -> bool {
+    PROFILER.lock().expect("Mutex lock failure").is_some()
+}
+
+pub fn start_profiler(
+    fname: &str,
+    machine: &Pin<Box<AsmMachine>>,
+    program: &Bytes,
+    frequency_per_sec: i32,
+) -> Result<(), String> {
+    if is_profiler_started() {
+        return Err("Profiler already started!".to_string());
+    }
+
+    let context = build_context(program)?;
+
+    // install signal handler
+    let handler = signal::SigHandler::Handler(perf_signal_handler);
+    let sigaction = signal::SigAction::new(
+        handler,
+        signal::SaFlags::SA_RESTART,
+        signal::SigSet::empty(),
+    );
+    unsafe { signal::sigaction(signal::SIGPROF, &sigaction) }
+        .map_err(|e| format!("sigaction install error: {}", e))?;
+
+    let profiler = Profiler {
+        fname: fname.to_string(),
+        machine: machine.deref() as *const AsmMachine as usize,
+        context,
+        timer: Timer::new(frequency_per_sec),
+        report: Report::default(),
+    };
+
+    *(PROFILER.lock().expect("Mutex lock failure")) = Some(profiler);
+
+    Ok(())
+}
+
+pub fn stop_profiler() -> Result<(), String> {
+    let mut profiler = PROFILER.lock().expect("Mutex lock failure");
+    if profiler.is_none() {
+        return Err("Profiler not started!".to_string());
+    }
+    // save profiled data
+    let inner_profiler = profiler.deref().as_ref().unwrap();
+    let fname = &inner_profiler.fname;
+    let timing = inner_profiler.timer.timing();
+    let profile_data = inner_profiler
+        .report
+        .pprof(timing)
+        .expect("pprof serialization");
+    let data = profile_data
+        .write_to_bytes()
+        .expect("protobuf serialization");
+    fs::write(fname, data).expect("write");
+
+    // uninstall signal handler
+    let handler = signal::SigHandler::SigIgn;
+    unsafe { signal::signal(signal::SIGPROF, handler) }
+        .map_err(|e| format!("sigaction uninstall error: {}", e))?;
+
+    *profiler = None;
+
+    Ok(())
+}
+
 lazy_static! {
     static ref PROFILER: Mutex<Option<Profiler>> = Mutex::new(None);
 }
@@ -98,10 +165,6 @@ extern "C" fn perf_signal_handler(_signal: c_int) {
     }
 }
 
-pub fn is_profiler_started() -> bool {
-    PROFILER.lock().expect("Mutex lock failure").is_some()
-}
-
 fn build_context(program: &Bytes) -> Result<DebugContext, String> {
     use addr2line::object::{Object, ObjectSection};
 
@@ -138,67 +201,4 @@ fn build_context(program: &Bytes) -> Result<DebugContext, String> {
         addr_context,
         debug_frame: debug_frame_reader.into(),
     })
-}
-
-pub fn start_profiler(
-    fname: &str,
-    machine: &Pin<Box<AsmMachine>>,
-    program: &Bytes,
-    frequency_per_sec: i32,
-) -> Result<(), String> {
-    if is_profiler_started() {
-        return Err("Profiler already started!".to_string());
-    }
-
-    let context = build_context(program)?;
-
-    // install signal handler
-    let handler = signal::SigHandler::Handler(perf_signal_handler);
-    let sigaction = signal::SigAction::new(
-        handler,
-        signal::SaFlags::SA_RESTART,
-        signal::SigSet::empty(),
-    );
-    unsafe { signal::sigaction(signal::SIGPROF, &sigaction) }
-        .map_err(|e| format!("sigaction install error: {}", e))?;
-
-    let profiler = Profiler {
-        fname: fname.to_string(),
-        machine: machine.deref() as *const AsmMachine as usize,
-        context,
-        timer: Timer::new(frequency_per_sec),
-        report: Report::default(),
-    };
-
-    *(PROFILER.lock().expect("Mutex lock failure")) = Some(profiler);
-
-    Ok(())
-}
-
-pub fn stop_profiler() -> Result<(), String> {
-    let mut profiler = PROFILER.lock().expect("Mutex lock failure");
-    if profiler.is_none() {
-        return Err("Profiler not started!".to_string());
-    }
-    // save profiled data
-    let inner_profiler = profiler.deref().as_ref().unwrap();
-    let fname = &inner_profiler.fname;
-    let timing = inner_profiler.timer.timing();
-    let profile_data = inner_profiler
-        .report
-        .pprof(timing)
-        .expect("pprof serialization");
-    let data = profile_data
-        .write_to_bytes()
-        .expect("protobuf serialization");
-    fs::write(fname, data).expect("write");
-
-    // uninstall signal handler
-    let handler = signal::SigHandler::SigIgn;
-    unsafe { signal::signal(signal::SIGPROF, handler) }
-        .map_err(|e| format!("sigaction uninstall error: {}", e))?;
-
-    *profiler = None;
-
-    Ok(())
 }
