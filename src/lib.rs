@@ -9,7 +9,9 @@ use crate::{
     frames::{Frame, Report, Symbol},
     timer::Timer,
 };
-use ckb_vm::{machine::asm::AsmMachine, Bytes, CoreMachine};
+use addr2line::gimli::{self, Error as GimliError, RegisterRule, RiscV, UnwindSection};
+use ckb_vm::{machine::asm::AsmMachine, Bytes, CoreMachine, Memory};
+use log::trace;
 use nix::sys::signal;
 use protobuf::Message;
 use std::borrow::Cow;
@@ -90,14 +92,13 @@ lazy_static! {
     static ref PROFILER: Mutex<Option<Profiler>> = Mutex::new(None);
 }
 
-type Addr2LineEndianReader =
-    addr2line::gimli::EndianReader<addr2line::gimli::RunTimeEndian, Arc<[u8]>>;
+type Addr2LineEndianReader = gimli::EndianReader<gimli::RunTimeEndian, Arc<[u8]>>;
 type Addr2LineContext = addr2line::Context<Addr2LineEndianReader>;
 type Addr2LineFrameIter<'a> = addr2line::FrameIter<'a, Addr2LineEndianReader>;
 
 struct DebugContext {
     addr_context: Addr2LineContext,
-    debug_frame: addr2line::gimli::DebugFrame<Addr2LineEndianReader>,
+    debug_frame: gimli::DebugFrame<Addr2LineEndianReader>,
 }
 
 struct Profiler {
@@ -110,13 +111,168 @@ struct Profiler {
     report: Report,
 }
 
-// A temporary work till frame is properly implemented
-fn extract_frame(pc: u64, context: &DebugContext) -> Frame {
+struct StackUnwinder<'a, 'b> {
+    context: &'a DebugContext,
+    machine: &'a mut AsmMachine<'b>,
+    // Only keeping 3 registers here: 0 is pc, 1 is ra, 2 is s0(fp).
+    registers: [Option<u64>; 32],
+    state: Option<(gimli::UnwindTableRow<Addr2LineEndianReader>, u64)>,
+    unwind_context: gimli::UnwindContext<Addr2LineEndianReader>,
+    at_start: bool,
+}
+
+struct UnwindInfo {
+    row: gimli::UnwindTableRow<Addr2LineEndianReader>,
+    // personality: Option<Pointer>,
+    // lsda: Option<Pointer>,
+    // initial_address: u64,
+}
+
+impl<'a, 'b> StackUnwinder<'a, 'b> {
+    fn new(context: &'a DebugContext, machine: &'a mut AsmMachine<'b>) -> Self {
+        let mut registers = [None; 32];
+        for (i, v) in machine.machine.registers().iter().enumerate() {
+            registers[i] = Some(*v);
+        }
+        Self {
+            context,
+            machine,
+            registers,
+            state: None,
+            unwind_context: gimli::UnwindContext::new(),
+            at_start: true,
+        }
+    }
+
+    fn unwind_info(&mut self, address: u64) -> Result<Option<UnwindInfo>, String> {
+        let bases = Default::default();
+        let fde = self.context.debug_frame.fde_for_address(
+            &bases,
+            address,
+            gimli::DebugFrame::cie_from_offset,
+        );
+        let fde = match fde {
+            Ok(fde) => fde,
+            Err(e) => {
+                if e == GimliError::NoUnwindInfoForAddress {
+                    trace!("Unwind stopping at {:x}", address);
+                    return Ok(None);
+                } else {
+                    return Err(format!(
+                        "Error from fde_for_address: \"{}\", address: {:x}",
+                        e, address
+                    ));
+                }
+            }
+        };
+        let mut table = fde
+            .rows(&self.context.debug_frame, &bases, &mut self.unwind_context)
+            .map_err(|e| {
+                format!(
+                    "Error creating UnwindTable: \"{}\", address: {:x}",
+                    e, address
+                )
+            })?;
+
+        let mut result_row = None;
+        while let Some(row) = table
+            .next_row()
+            .map_err(|e| format!("Error fetching next row: {}", e))?
+        {
+            if row.contains(address) {
+                result_row = Some(row.clone());
+                break;
+            }
+        }
+
+        if result_row.is_none() {
+            trace!("Unwind row iteration stopping at {:x}", address);
+        }
+
+        Ok(result_row.map(|row| UnwindInfo { row }))
+    }
+
+    fn generate_state(
+        &mut self,
+        address: u64,
+    ) -> Result<Option<(gimli::UnwindTableRow<Addr2LineEndianReader>, u64)>, String> {
+        let UnwindInfo { row } = match self.unwind_info(address) {
+            Ok(Some(info)) => info,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let cfa = match *row.cfa() {
+            gimli::CfaRule::RegisterAndOffset { register, offset } => self.registers
+                [register.0 as usize]
+                .expect("missing register value for cfa")
+                .wrapping_add(offset as u64),
+            _ => return Err(format!("Unknown cfa calculation rule: {:?}", row.cfa())),
+        };
+        Ok(Some((row, cfa)))
+    }
+}
+
+impl<'a, 'b> Iterator for StackUnwinder<'a, 'b> {
+    type Item = Symbol;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // handle PC
+        if self.at_start {
+            self.at_start = false;
+            let pc = *self.machine.machine.pc();
+            self.state = self.generate_state(pc).expect("unwinding state");
+            if self.state.is_none() {
+                self.registers[RiscV::RA.0 as usize] = None;
+            }
+            return Some(extract_symbol(pc, &self.context));
+        }
+
+        if let Some((row, cfa)) = self.state.take() {
+            let mut newregs = self.registers.clone();
+            newregs[RiscV::RA.0 as usize] = None;
+            for &(reg, ref rule) in row.registers() {
+                assert!(reg != RiscV::SP);
+                newregs[reg.0 as usize] = match *rule {
+                    RegisterRule::Undefined => unreachable!(),
+                    RegisterRule::SameValue => self.registers[reg.0 as usize],
+                    RegisterRule::Register(r) => self.registers[r.0 as usize],
+                    RegisterRule::Offset(n) => Some(
+                        self.machine
+                            .machine
+                            .memory_mut()
+                            .load64(&cfa.wrapping_add(n as u64))
+                            .expect("load memory"),
+                    ),
+                    RegisterRule::ValOffset(n) => Some(cfa.wrapping_add(n as u64)),
+                    RegisterRule::Expression(_) => unimplemented!(),
+                    RegisterRule::ValExpression(_) => unimplemented!(),
+                    RegisterRule::Architectural => unreachable!(),
+                };
+            }
+            newregs[RiscV::SP.0 as usize] = Some(cfa);
+
+            self.registers = newregs;
+        }
+
+        if let Some(caller) = self.registers[RiscV::RA.0 as usize] {
+            // Unwinding
+            self.state = self.generate_state(caller).expect("unwinding state");
+            if self.state.is_none() {
+                self.registers[RiscV::RA.0 as usize] = None;
+            }
+            Some(extract_symbol(caller, &self.context))
+        } else {
+            None
+        }
+    }
+}
+
+// Inspired from ckb-vm-pprof
+fn extract_symbol(pc: u64, context: &DebugContext) -> Symbol {
     let addr_context = &context.addr_context;
     let mut file = None;
     let mut line = None;
 
-    // TODO: trace frame to reveal the whole stack
     let loc = addr_context.find_location(pc).unwrap();
     if let Some(loc) = loc {
         file = Some(loc.file.as_ref().unwrap().to_string());
@@ -126,7 +282,7 @@ fn extract_frame(pc: u64, context: &DebugContext) -> Frame {
     }
     let mut frame_iter = addr_context.find_frames(pc).unwrap();
     let sprint_fun = |frame_iter: &mut Addr2LineFrameIter| {
-        let mut s = String::from("??");
+        let mut s = String::from("<Unknown>");
         loop {
             if let Some(data) = frame_iter.next().unwrap() {
                 if let Some(function) = data.function {
@@ -143,25 +299,25 @@ fn extract_frame(pc: u64, context: &DebugContext) -> Frame {
     };
     let func = sprint_fun(&mut frame_iter);
 
-    let symbol = Symbol {
+    Symbol {
         name: Some(func),
         line,
         file,
-    };
-    let mut frame = Frame::default();
-    frame.stacks.push(symbol);
-    frame
+    }
 }
 
 extern "C" fn perf_signal_handler(_signal: c_int) {
     let mut profiler = PROFILER.lock().expect("Mutex lock failure");
     if let Some(profiler) = profiler.deref_mut() {
-        let machine = unsafe { &*(profiler.machine as *const AsmMachine) as &AsmMachine };
+        let machine = unsafe { &mut *(profiler.machine as *mut AsmMachine) as &mut AsmMachine };
 
-        let pc = *machine.machine.pc();
-        let frame = extract_frame(pc, &profiler.context);
-
-        profiler.report.record(&frame);
+        trace!("Start profiling from {:x}", machine.machine.pc());
+        let mut stacks = vec![];
+        for stack in StackUnwinder::new(&profiler.context, machine) {
+            trace!("Stack item: {:?}", stack);
+            stacks.push(stack);
+        }
+        profiler.report.record(&Frame { stacks });
     }
 }
 
@@ -173,28 +329,28 @@ fn build_context(program: &Bytes) -> Result<DebugContext, String> {
     let file = addr2line::object::File::parse(program.as_ref())
         .map_err(|e| format!("object parsing error: {}", e))?;
 
-    let dwarf = addr2line::gimli::Dwarf::load(|id| {
+    let dwarf = gimli::Dwarf::load(|id| {
         let data = file
             .section_by_name(id.name())
             .and_then(|section| section.uncompressed_data().ok())
             .unwrap_or(Cow::Borrowed(&[]));
-        Ok(addr2line::gimli::EndianArcSlice::new(
+        Ok(gimli::EndianArcSlice::new(
             Arc::from(&*data),
-            addr2line::gimli::RunTimeEndian::Little,
+            gimli::RunTimeEndian::Little,
         ))
     })
-    .map_err(|e: addr2line::gimli::Error| format!("dwarf load error: {}", e))?;
+    .map_err(|e: gimli::Error| format!("dwarf load error: {}", e))?;
 
     let addr_context = Addr2LineContext::from_dwarf(dwarf)
         .map_err(|e| format!("context creation error: {}", e))?;
 
     let debug_frame_section = file
-        .section_by_name(addr2line::gimli::SectionId::DebugFrame.name())
+        .section_by_name(gimli::SectionId::DebugFrame.name())
         .and_then(|s| s.uncompressed_data().ok())
         .ok_or_else(|| "Provided binary is missing .debug_frame section!".to_string())?;
     let debug_frame_reader = Addr2LineEndianReader::new(
         Arc::from(&*debug_frame_section),
-        addr2line::gimli::RunTimeEndian::Little,
+        gimli::RunTimeEndian::Little,
     );
 
     Ok(DebugContext {

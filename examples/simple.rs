@@ -53,6 +53,8 @@ impl<Mac: SupportMachine> Syscalls<Mac> for Debugger {
 }
 
 fn main() {
+    env_logger::init();
+
     let args: Vec<String> = env::args().skip(1).collect();
     let code = std::fs::read(args[0].clone()).unwrap().into();
     let args: Vec<Bytes> = args.into_iter().map(|a| a.into()).collect();

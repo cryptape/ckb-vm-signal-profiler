@@ -13,7 +13,7 @@ pub struct Symbol {
 
 impl Symbol {
     pub fn name(&self) -> String {
-        self.name.clone().unwrap_or("Unknown".to_owned())
+        self.name.clone().unwrap_or("<Unknown>".to_owned())
     }
 
     pub fn line(&self) -> u32 {
@@ -21,7 +21,7 @@ impl Symbol {
     }
 
     pub fn file(&self) -> String {
-        self.file.clone().unwrap_or("Unknown".to_owned())
+        self.file.clone().unwrap_or("<Unknown>".to_owned())
     }
 }
 
