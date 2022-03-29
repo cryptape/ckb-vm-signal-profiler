@@ -5,3 +5,7 @@ Signal based profiler for [ckb-vm](https://github.com/nervosnetwork/ckb-vm). Lik
 See [here](./examples/simple.rs) for an example on using this library.
 
 This library inherits a lot of the signal handler related code from [pprof-rs](https://github.com/tikv/pprof-rs) library.
+
+# Notes
+
+* If anything weird happens when loading the generated profiling data, make sure you are using the golang based pprof at [here](https://github.com/google/pprof), not the binary from [gperftools](https://github.com/gperftools/gperftools) with the same name.

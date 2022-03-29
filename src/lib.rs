@@ -220,10 +220,8 @@ impl<'a, 'b> Iterator for StackUnwinder<'a, 'b> {
         if self.at_start {
             self.at_start = false;
             let pc = *self.machine.machine.pc();
-            self.state = self.generate_state(pc).expect("unwinding state");
-            if self.state.is_none() {
-                self.registers[RiscV::RA.0 as usize] = None;
-            }
+            // TODO: what if ra just gets overwritten in the top frame?
+            // self.state = self.generate_state(pc).expect("unwinding state");
             return Some(extract_symbol(pc, &self.context));
         }
 
@@ -258,7 +256,7 @@ impl<'a, 'b> Iterator for StackUnwinder<'a, 'b> {
             // Unwinding
             self.state = self.generate_state(caller).expect("unwinding state");
             if self.state.is_none() {
-                self.registers[RiscV::RA.0 as usize] = None;
+                return None;
             }
             Some(extract_symbol(caller, &self.context))
         } else {
@@ -311,13 +309,14 @@ extern "C" fn perf_signal_handler(_signal: c_int) {
     if let Some(profiler) = profiler.deref_mut() {
         let machine = unsafe { &mut *(profiler.machine as *mut AsmMachine) as &mut AsmMachine };
 
-        trace!("Start profiling from {:x}", machine.machine.pc());
+        trace!("### Start profiling from {:x}", machine.machine.pc());
         let mut stacks = vec![];
         for stack in StackUnwinder::new(&profiler.context, machine) {
             trace!("Stack item: {:?}", stack);
             stacks.push(stack);
         }
         profiler.report.record(&Frame { stacks });
+        trace!("### Done profiling for {:x}", machine.machine.pc());
     }
 }
 
